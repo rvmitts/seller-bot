@@ -288,6 +288,108 @@ $ APP_BASE_URL='http://...' TELEGRAM_BOT_TOKEN='***' node src/scripts/telegram-w
 {"ok": false, "code": 2, "message": "APP_BASE_URL must start with https:// (Telegram requires HTTPS)"}
 ```
 
+### 6.6 Live Telegram round-trip (`@signalptest_bot`)
+
+Executed end-to-end against api.telegram.org in this session. Token-derived values are masked; only the bot's @handle (the documented `TELEGRAM_BOT_ADDRESS`) and operational identifiers (chat_id masked, incident UUID, callback_query_id, telegram_update_id) are shown.
+
+**Setup**
+
+```text
+$ cloudflared tunnel --protocol http2 --url http://localhost:3000
+Your quick Tunnel has been created!
+https://events-ericsson-improving-hip.trycloudflare.com
+... Registered tunnel connection ... protocol=http2
+
+$ curl -s $APP_BASE_URL/health/live    # via tunnel
+{"status":"ok",...} HTTP 200
+$ curl -s $APP_BASE_URL/health/ready
+{"status":"ok","checks":{"db":{"status":"ok","latencyMs":8}}} HTTP 200
+
+$ npm run telegram:me
+{ "ok": true, "me": { "id": 8907817070, "is_bot": true, "first_name": "SGT",
+                       "username": "signalptest_bot", ... },
+  "tokenMasked": "8907…vI" }
+
+$ npm run telegram:webhook:set
+{ "ok": true, "action": "set",
+  "url": "https://events-ericsson-improving-hip.trycloudflare.com/internal/telegram/webhook",
+  "secret_set": true, "result": true }
+
+$ npm run telegram:webhook:info
+{ "ok": true, "info": {
+    "url": "https://events-ericsson-improving-hip.trycloudflare.com/internal/telegram/webhook",
+    "pending_update_count": 0, "max_connections": 40,
+    "allowed_updates": [ "message", "callback_query" ] } }
+```
+
+**Operator /start (chat captured by webhook)**
+
+```text
+$ psql -c "SELECT chat_type, username, first_name, last_text, last_seen_at::text FROM telegram_chats;"
+ chat_type | username       | first_name | last_text | last_seen_at
+-----------+----------------+------------+-----------+-------------------------------
+ private   | gross_support  | Dm         | /start    | 2026-05-24 05:29:21.762+00
+```
+
+(chat_id is stored verbatim in the table — it's an operational identifier, not a secret. The `send-test-alert` script masks it on output.)
+
+**Send test alert**
+
+```text
+$ npm run telegram:send-test-alert
+{
+  "ok": true,
+  "incidentId": "20089153-562a-461b-8e58-1216160b2b6c",
+  "chatIdSource": "captured_from_webhook",
+  "chatIdMasked": "16***24",
+  "messageId": 25,
+  "buttons": ["Проверяю", "Статус", "Пауза", "Исправил"],
+  "tokenMasked": "8907…vI"
+}
+```
+
+The operator (`@gross_support`) then pressed each button in order. Server logs (token never appears):
+
+```text
+[info] telegram update received: id=475415119 kind=callback_query
+[info] callback handled: action=checking reason=applied prev=open           new=checking
+[info] telegram update received: id=475415120 kind=callback_query
+[info] callback handled: action=status   reason=applied prev=checking       new=checking
+[info] telegram update received: id=475415121 kind=callback_query
+[info] callback handled: action=pause    reason=applied prev=checking       new=paused
+[info] telegram update received: id=475415122 kind=callback_query
+[info] callback handled: action=fixed    reason=applied prev=paused         new=fixed_reported
+```
+
+(No `[error] answerCallbackQuery` lines — each press also delivered a toast reply back to the user, confirming the full round-trip.)
+
+**DB state — live round-trip**
+
+```text
+-- incidents
+                  id                  |     status     |    kind    |          created_at
+--------------------------------------+----------------+------------+-------------------------------
+ 20089153-562a-461b-8e58-1216160b2b6c | fixed_reported | test_alert | 2026-05-24 05:29:37.097289+00
+
+-- actions (4 rows, ordered by created_at)
+ action_type | previous_status |   new_status   | performed_by_tg_username
+-------------+-----------------+----------------+--------------------------
+ checking    | open            | checking       | gross_support
+ status      | checking        | checking       | gross_support
+ pause       | checking        | paused         | gross_support
+ fixed       | paused          | fixed_reported | gross_support
+
+-- callback_audit (4 rows, all applied)
+ callback_query_id  | action_label | response_status | notes                                            | telegram_update_id
+--------------------+--------------+-----------------+--------------------------------------------------+--------------------
+ 7265447099878276259 | Проверяю    | applied         | previous=open new=checking action=checking       |          475415119
+ 7265447096956301378 | Статус      | applied         | previous=checking new=checking action=status     |          475415120
+ 7265447097124339873 | Пауза       | applied         | previous=checking new=paused action=pause        |          475415121
+ 7265447097506758902 | Исправил    | applied         | previous=paused new=fixed_reported action=fixed  |          475415122
+```
+
+The four distinct `callback_query_id` values from Telegram are stored as-is, suitable for replay-deduplication via the `UNIQUE` constraint (proven in §6.3). The incident's final status `fixed_reported` matches the last button pressed.
+
 ## 7. PASS/FAIL summary (per acceptance criteria)
 
 | Check                                                              | Result | Evidence |
@@ -296,7 +398,7 @@ $ APP_BASE_URL='http://...' TELEGRAM_BOT_TOKEN='***' node src/scripts/telegram-w
 | API still passes `/health/ready` with Postgres                      | PASS   | `curl /health/ready → HTTP 200 status:"ok" checks.db.status:"ok"` |
 | Telegram webhook endpoint exists                                    | PASS   | `POST /internal/telegram/webhook` in `src/telegram/webhook.js`; `npm run telegram:webhook:set` configures it |
 | Telegram webhook rejects bad secret                                 | PASS   | §6.1 — 401 for missing/wrong header |
-| Telegram test alert can be sent with all four buttons               | PASS (code) / **BLOCKED** (live) | `src/scripts/send-test-alert.js` builds the keyboard and calls `sendMessage`; live round-trip requires `TELEGRAM_BOT_TOKEN` + a captured chat. See §8. |
+| Telegram test alert can be sent with all four buttons               | **PASS (live)** | §6.6 — live round-trip via `@signalptest_bot` over Cloudflare Tunnel: `send-test-alert` returned `{ok:true, incidentId:"20089153…", chatIdSource:"captured_from_webhook", chatIdMasked:"16***24", messageId:25}`. All 4 buttons rendered. |
 | Callback `Проверяю` is received and changes status/action           | PASS   | §6.3 — `open → checking`; row in `actions`; row in `callback_audit` |
 | Callback `Статус` returns current state without corrupting data     | PASS   | §6.3 — incident.status unchanged (`checking → checking`); action row records `previous=checking, new=checking` |
 | Callback `Пауза` changes status/action (records pause intent)       | PASS   | §6.3 — `checking → paused` |
@@ -306,18 +408,16 @@ $ APP_BASE_URL='http://...' TELEGRAM_BOT_TOKEN='***' node src/scripts/telegram-w
 | Unknown-incident callbacks do not crash                             | PASS   | §6.3 — `unknown_incident` row, FK skipped |
 | No secrets exposed in logs / DB / report / commits                  | PASS   | Token only ever sourced from `process.env.TELEGRAM_BOT_TOKEN`; `maskToken()` used wherever a token-derived value would otherwise appear |
 
-## 8. BLOCKED — live Telegram round-trip
+## 8. Live-proof inputs (now satisfied)
 
-The code paths are implemented and proven against a live local Postgres + a running API. The live round-trip with real Telegram requires only the following inputs in the runtime environment of this Devin session:
+The live round-trip in §6.6 was performed in this Devin session after the operator provided the inputs below. They are listed here so future sessions can reproduce it.
 
-| Missing input          | How to provide                                                                            |
-|------------------------|-------------------------------------------------------------------------------------------|
-| `TELEGRAM_BOT_TOKEN`   | Devin Secrets → org-scoped. Never printed; consumed by `process.env` only.               |
-| `TELEGRAM_BOT_ADDRESS` | Devin Secrets or env. The bot's @handle (e.g. `SellerNerveBot`, **no leading @**).        |
-| Public HTTPS URL       | Run one of the tunnels in §5 step 3 and export `APP_BASE_URL`. No new credential needed.  |
-| Operator /start        | After tunnels are up, open `t.me/<TELEGRAM_BOT_ADDRESS>` in any Telegram account and tap **Start**. This populates `telegram_chats` automatically and is the only "chat_id" the system needs. |
-
-Once the inputs above are present, the **exact** live-proof sequence is steps §5.4 → §5.7. No code changes are needed.
+| Input                  | How it was provided in this session                                                            |
+|------------------------|------------------------------------------------------------------------------------------------|
+| `TELEGRAM_BOT_TOKEN`   | Devin Secrets — temporary, session-only. Never printed; only accessed via `process.env`.       |
+| `TELEGRAM_BOT_ADDRESS` | Devin Secrets — `signalptest_bot` (bot's @handle, no `@`). Used only in docs / error messages. |
+| Public HTTPS URL       | `cloudflared tunnel --protocol http2 --url http://localhost:3000` → `APP_BASE_URL=https://events-ericsson-improving-hip.trycloudflare.com` (quick-Tunnel, ephemeral). |
+| Operator /start        | Operator opened `t.me/signalptest_bot` and tapped **Start**; `telegram_chats` row was upserted by the webhook (`username=gross_support`, `chat_type=private`).        |
 
 `TELEGRAM_TEST_CHAT_ID` is **not** required for live proof. It exists only as an optional override for non-interactive automation.
 
@@ -363,8 +463,8 @@ Commands run:
 Results:
 - API health:        PASS
 - DB readiness:      PASS
-- Telegram send:     PASS (code path) / BLOCKED (live — needs TELEGRAM_BOT_TOKEN + TELEGRAM_BOT_ADDRESS + tunnel + /start)
-- Telegram callbacks: PASS (Проверяю / Статус / Пауза / Исправил all applied; idempotent on replay)
+- Telegram send:     PASS (live — @signalptest_bot via cloudflared, message_id 25)
+- Telegram callbacks: PASS (Проверяю / Статус / Пауза / Исправил all applied live; idempotent on replay)
 - WB valid token:    N/A
 - WB invalid token:  N/A
 
@@ -375,7 +475,7 @@ Evidence:
 - see §6 (DB rows + logs); §7 (PASS/FAIL table)
 
 Blockers:
-- Live round-trip needs TELEGRAM_BOT_TOKEN and TELEGRAM_BOT_ADDRESS in this session's environment, plus a public HTTPS URL (any of the §5 tunnels), plus a single /start from any Telegram account to capture chat_id.
+- None. Live round-trip completed in this session against @signalptest_bot (see §6.6).
 
 Next pass recommendation:
 - Pass 3 — WB token validation per docs/devin/WB_API_PROOF_PLAN.md.
