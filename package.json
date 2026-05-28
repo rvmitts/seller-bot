@@ -13,7 +13,8 @@
     "telegram:webhook:info": "node src/scripts/telegram-webhook.js info",
     "telegram:webhook:set": "node src/scripts/telegram-webhook.js set",
     "telegram:webhook:delete": "node src/scripts/telegram-webhook.js delete",
-    "telegram:send-test-alert": "node src/scripts/send-test-alert.js"
+    "telegram:send-test-alert": "node src/scripts/send-test-alert.js",
+    "wb:validate": "node src/scripts/wb-validate.js"
   },
   "engines": {
     "node": ">=20.0.0"
